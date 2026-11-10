@@ -1,0 +1,487 @@
+
+Install:   pip install pyautogui
+Optional:  pip install pynput      
+
+Stopping:
+  * Press the Stop button, or
+  * Press F8 anywhere (only if pynput is installed), or
+  * Slam the mouse into any screen corner (PyAutoGUI fail-safe).
+    Because of this, do not place a click exactly in a screen corner.
+
+Notes:
+  * "Type text" supports standard keyboard characters only (no emoji/accents).
+  * Sequences can be saved to and loaded from .json files.
+  * macOS: grant your terminal / Python "Accessibility" permission.
+"""
+import json
+import sys
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog, filedialog
+
+if sys.platform == "win32":
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+import pyautogui
+
+try:
+    from pynput import keyboard as _kb
+except ImportError:
+    _kb = None
+
+pyautogui.PAUSE = 0          # timing is handled by Wait steps
+pyautogui.FAILSAFE = True    # mouse in a corner aborts
+
+# Tk keysym -> PyAutoGUI key name
+MODIFIERS = {
+    "Control_L": "ctrl", "Control_R": "ctrl",
+    "Shift_L": "shift", "Shift_R": "shift",
+    "Alt_L": "alt", "Alt_R": "alt",
+    "Win_L": "win", "Win_R": "win", "Super_L": "win", "Super_R": "win",
+    "Meta_L": "command", "Meta_R": "command",
+}
+MOD_ORDER = ["ctrl", "alt", "shift", "win", "command"]
+KEYSYM_MAP = {
+    "Return": "enter", "KP_Enter": "enter", "Escape": "esc", "BackSpace": "backspace",
+    "Tab": "tab", "space": "space", "Delete": "delete", "Insert": "insert",
+    "Home": "home", "End": "end", "Prior": "pageup", "Next": "pagedown",
+    "Up": "up", "Down": "down", "Left": "left", "Right": "right",
+    "Caps_Lock": "capslock", "Print": "printscreen",
+    "minus": "-", "equal": "=", "plus": "+", "comma": ",", "period": ".",
+    "slash": "/", "backslash": "\\", "semicolon": ";", "apostrophe": "'",
+    "bracketleft": "[", "bracketright": "]", "grave": "`",
+}
+
+
+def split_combo(combo):
+    """'ctrl+shift+s' -> ['ctrl', 'shift', 's'].  Handles the '+' key itself ('ctrl++')."""
+    combo = combo.strip().lower().replace(" ", "")
+    plus_key = combo == "+" or combo.endswith("++")
+    if plus_key:
+        combo = combo[:-1]
+    parts = [p for p in combo.split("+") if p]
+    if plus_key:
+        parts.append("+")
+    return parts
+
+
+class PointPicker:
+    """Full-screen translucent overlay. Click anywhere to capture that point; Esc cancels."""
+
+    def __init__(self, root, callback):
+        self.callback = callback
+        self.win = tk.Toplevel(root)
+        self.win.attributes("-fullscreen", True)
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-alpha", 0.35)
+        self.win.configure(bg="black", cursor="crosshair")
+
+        self.label = tk.Label(self.win, fg="white", bg="black",
+                              font=("Consolas", 20, "bold"))
+        self.label.place(relx=0.5, rely=0.05, anchor="n")
+
+        self.win.bind("<Motion>", self._motion)
+        self.win.bind("<Button-1>", self._click)
+        self.win.bind("<Escape>", lambda e: self._finish(None))
+        self.win.focus_force()
+        self._motion()
+
+    def _motion(self, event=None):
+        x, y = self.win.winfo_pointerxy()
+        self.label.config(text=f"Click to set point   X={x}  Y={y}   (Esc to cancel)")
+
+    def _click(self, event):
+        self._finish((event.x_root, event.y_root))
+
+    def _finish(self, point):
+        self.win.destroy()
+        self.callback(point)
+
+
+class KeyCaptureDialog:
+    """Modal dialog: press a key combination to record it, or type it manually."""
+
+    def __init__(self, root, initial=""):
+        self.result = None
+        self.held = set()
+        self.win = w = tk.Toplevel(root)
+        w.title("Key combination")
+        w.resizable(False, False)
+        w.transient(root)
+
+        ttk.Label(w, padding=10, justify="center",
+                  text="Press the key combination now.\n"
+                       "Or click the box and type it, e.g.  ctrl+p   alt+tab   f5").pack()
+        self.var = tk.StringVar(value=initial)
+        self.entry = ttk.Entry(w, textvariable=self.var, width=28,
+                               justify="center", font=("Consolas", 12))
+        self.entry.pack(padx=10)
+
+        btns = ttk.Frame(w, padding=10)
+        btns.pack()
+        ttk.Button(btns, text="OK", command=self.ok).pack(side="left")
+        ttk.Button(btns, text="Clear", command=lambda: self.var.set("")).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel", command=w.destroy).pack(side="left")
+
+        w.bind("<KeyPress>", self._press)
+        w.bind("<KeyRelease>", self._release)
+        w.bind("<FocusOut>", lambda e: self.held.clear())
+        w.grab_set()
+        w.focus_force()
+        root.wait_window(w)
+
+    def _press(self, e):
+        if self.win.focus_get() is self.entry:   # manual typing mode
+            return
+        ks = e.keysym
+        if ks in MODIFIERS:
+            self.held.add(MODIFIERS[ks])
+            return "break"
+        key = ks.lower() if len(ks) == 1 else KEYSYM_MAP.get(ks, ks.lower())
+        mods = [m for m in MOD_ORDER if m in self.held]
+        self.var.set("+".join(mods + [key]))
+        return "break"
+
+    def _release(self, e):
+        if e.keysym in MODIFIERS:
+            self.held.discard(MODIFIERS[e.keysym])
+
+    def ok(self):
+        parts = split_combo(self.var.get())
+        bad = [p for p in parts if p not in pyautogui.KEYBOARD_KEYS]
+        if not parts or bad:
+            messagebox.showerror("Invalid keys",
+                                 f"Unrecognized key(s): {', '.join(bad) or '(empty)'}\n"
+                                 "Use names like ctrl, alt, shift, win, enter, esc, tab, f5, a, 1.",
+                                 parent=self.win)
+            return
+        self.result = "+".join(parts)
+        self.win.destroy()
+
+
+def describe(step):
+    t = step["type"]
+    if t == "click":
+        x, y = step["point"]
+        return f"Click   ({x}, {y})"
+    if t == "keys":
+        return f"Keys    {step['keys']}"
+    if t == "type":
+        text = step["text"]
+        return f'Type    "{text if len(text) <= 24 else text[:24] + "…"}"'
+    if t == "wait":
+        return f"Wait    {step['seconds']:g} s"
+    return "?"
+
+
+class SequenceClicker:
+    def __init__(self, root):
+        self.root = root
+        root.title("Sequence Auto Clicker")
+        root.resizable(False, False)
+
+        self.steps = []
+        self.stop_event = threading.Event()
+        self.worker = None
+        self.lockable = []   # widgets disabled while running
+
+        main = ttk.Frame(root, padding=12)
+        main.grid()
+
+        # --- Sequence editor ---------------------------------------------
+        seq = ttk.LabelFrame(main, text="Sequence (runs top to bottom, then loops)", padding=8)
+        seq.grid(row=0, column=0, sticky="ew")
+
+        self.listbox = tk.Listbox(seq, width=40, height=14, font=("Consolas", 10),
+                                  activestyle="none", exportselection=False)
+        self.listbox.grid(row=0, column=0, sticky="ns")
+        sb = ttk.Scrollbar(seq, orient="vertical", command=self.listbox.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.listbox.config(yscrollcommand=sb.set)
+        self.listbox.bind("<Double-Button-1>", lambda e: self.edit_step())
+
+        side = ttk.Frame(seq)
+        side.grid(row=0, column=2, sticky="n", padx=(8, 0))
+        layout = [
+            ("+ Click", self.add_click), ("+ Keys", self.add_keys),
+            ("+ Type text", self.add_type), ("+ Wait", self.add_wait), None,
+            ("Edit", self.edit_step), ("Remove", self.remove_step),
+            ("Move up", lambda: self.move(-1)), ("Move down", lambda: self.move(1)),
+            ("Show point", self.show_point), None,
+            ("Save…", self.save), ("Load…", self.load),
+        ]
+        for item in layout:
+            if item is None:
+                ttk.Separator(side).pack(fill="x", pady=5)
+                continue
+            b = ttk.Button(side, text=item[0], command=item[1], width=12)
+            b.pack(fill="x", pady=1)
+            self.lockable.append(b)
+
+        # --- Settings -----------------------------------------------------
+        cfg = ttk.LabelFrame(main, text="Settings", padding=8)
+        cfg.grid(row=1, column=0, sticky="ew", pady=8)
+        self.vars = {}
+        fields = [
+            ("loops",       "Number of loops (0 = until stopped)", "10"),
+            ("loop_delay",  "Delay between loops (s)",             "1.0"),
+            ("start_delay", "Countdown before starting (s)",       "3"),
+        ]
+        for i, (key, text, default) in enumerate(fields):
+            ttk.Label(cfg, text=text).grid(row=i, column=0, sticky="w")
+            var = tk.StringVar(value=default)
+            ttk.Entry(cfg, textvariable=var, width=8).grid(row=i, column=1, padx=6, pady=2)
+            self.vars[key] = var
+
+        ttk.Label(cfg, text="Mouse button for clicks").grid(row=len(fields), column=0, sticky="w")
+        self.button_var = tk.StringVar(value="left")
+        ttk.Combobox(cfg, textvariable=self.button_var, values=("left", "right", "middle"),
+                     state="readonly", width=6).grid(row=len(fields), column=1, padx=6, pady=2)
+
+        # --- Controls -----------------------------------------------------
+        ctl = ttk.Frame(main)
+        ctl.grid(row=2, column=0, sticky="ew")
+        self.start_btn = ttk.Button(ctl, text="Start", command=self.start)
+        self.start_btn.pack(side="left", expand=True, fill="x")
+        self.lockable.append(self.start_btn)
+        self.stop_btn = ttk.Button(ctl, text="Stop", command=self.stop, state="disabled")
+        self.stop_btn.pack(side="left", expand=True, fill="x", padx=(6, 0))
+
+        hint = "F8 or mouse-to-corner stops" if _kb else "Mouse-to-corner stops (pip install pynput for F8)"
+        self.status = tk.StringVar(value=f"Add steps to begin. {hint}.")
+        ttk.Label(main, textvariable=self.status, foreground="gray").grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+        if _kb:
+            self.listener = _kb.Listener(on_press=lambda k: self.stop() if k == _kb.Key.f8 else None)
+            self.listener.daemon = True
+            self.listener.start()
+
+    # ---------------- helpers ----------------
+    def _running(self):
+        return self.worker is not None and self.worker.is_alive()
+
+    def _selected(self):
+        sel = self.listbox.curselection()
+        return sel[0] if sel else None
+
+    def _refresh(self, select=None):
+        self.listbox.delete(0, "end")
+        for i, s in enumerate(self.steps, 1):
+            self.listbox.insert("end", f"{i:>2}. {describe(s)}")
+        if select is not None and 0 <= select < len(self.steps):
+            self.listbox.selection_set(select)
+            self.listbox.see(select)
+
+    def _put(self, step, index=None):
+        """index=None: insert after the selected step (or at the end). Otherwise replace that step."""
+        if index is None:
+            sel = self._selected()
+            index = sel + 1 if sel is not None else len(self.steps)
+            self.steps.insert(index, step)
+        else:
+            self.steps[index] = step
+        self._refresh(select=index)
+
+    # ---------------- adding / editing steps ----------------
+    def add_click(self, index=None):
+        self.root.withdraw()
+
+        def done(point):
+            self.root.deiconify()
+            if point:
+                self._put({"type": "click", "point": list(point)}, index)
+
+        self.root.after(200, lambda: PointPicker(self.root, done))
+
+    def add_keys(self, index=None):
+        initial = self.steps[index]["keys"] if index is not None else ""
+        dlg = KeyCaptureDialog(self.root, initial)
+        if dlg.result:
+            self._put({"type": "keys", "keys": dlg.result}, index)
+
+    def add_type(self, index=None):
+        initial = self.steps[index]["text"] if index is not None else ""
+        text = simpledialog.askstring("Type text", "Text to type:", initialvalue=initial, parent=self.root)
+        if text:
+            self._put({"type": "type", "text": text}, index)
+
+    def add_wait(self, index=None):
+        initial = self.steps[index]["seconds"] if index is not None else 0.5
+        secs = simpledialog.askfloat("Wait", "Seconds to wait:", initialvalue=initial,
+                                     minvalue=0, parent=self.root)
+        if secs is not None:
+            self._put({"type": "wait", "seconds": secs}, index)
+
+    def edit_step(self):
+        i = self._selected()
+        if i is None or self._running():
+            return
+        {"click": self.add_click, "keys": self.add_keys,
+         "type": self.add_type, "wait": self.add_wait}[self.steps[i]["type"]](i)
+
+    def remove_step(self):
+        i = self._selected()
+        if i is not None:
+            del self.steps[i]
+            self._refresh(select=min(i, len(self.steps) - 1))
+
+    def move(self, direction):
+        i = self._selected()
+        if i is None:
+            return
+        j = i + direction
+        if 0 <= j < len(self.steps):
+            self.steps[i], self.steps[j] = self.steps[j], self.steps[i]
+            self._refresh(select=j)
+
+    def show_point(self):
+        i = self._selected()
+        if i is not None and self.steps[i]["type"] == "click":
+            pyautogui.moveTo(*self.steps[i]["point"], duration=0.3)
+
+    # ---------------- save / load ----------------
+    def save(self):
+        path = filedialog.asksaveasfilename(defaultextension=".json",
+                                            filetypes=[("Sequence", "*.json")])
+        if not path:
+            return
+        data = {
+            "steps": self.steps,
+            "settings": {k: v.get() for k, v in self.vars.items()},
+            "button": self.button_var.get(),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        self.status.set(f"Saved {len(self.steps)} step(s).")
+
+    def load(self):
+        path = filedialog.askopenfilename(filetypes=[("Sequence", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            steps = data["steps"]
+            for s in steps:
+                if s.get("type") not in ("click", "keys", "type", "wait"):
+                    raise ValueError(f"unknown step type: {s.get('type')}")
+        except Exception as e:
+            messagebox.showerror("Load failed", f"Could not read that file.\n{e}")
+            return
+        self.steps = steps
+        for k, v in data.get("settings", {}).items():
+            if k in self.vars:
+                self.vars[k].set(v)
+        self.button_var.set(data.get("button", "left"))
+        self._refresh()
+        self.status.set(f"Loaded {len(self.steps)} step(s).")
+
+    # ---------------- running ----------------
+    def start(self):
+        if self._running():
+            return
+        if not self.steps:
+            messagebox.showwarning("Empty sequence", "Add at least one step first.")
+            return
+        try:
+            loops = int(self.vars["loops"].get())
+            loop_delay = float(self.vars["loop_delay"].get())
+            start_delay = float(self.vars["start_delay"].get())
+            if loops < 0 or loop_delay < 0 or start_delay < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid input",
+                                 "Delays must be non-negative numbers; loops must be a non-negative whole number.")
+            return
+
+        self.stop_event.clear()
+        self._set_locked(True)
+        steps = [dict(s) for s in self.steps]   # snapshot
+        self.worker = threading.Thread(
+            target=self._run,
+            args=(steps, loops, loop_delay, start_delay, self.button_var.get()),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def _set_locked(self, locked):
+        for w in self.lockable:
+            w.config(state="disabled" if locked else "normal")
+        self.stop_btn.config(state="normal" if locked else "disabled")
+
+    def _status(self, text):
+        self.root.after(0, self.status.set, text)
+
+    def _highlight(self, i):
+        def apply():
+            self.listbox.selection_clear(0, "end")
+            self.listbox.selection_set(i)
+            self.listbox.see(i)
+        self.root.after(0, apply)
+
+    def _do(self, step, button):
+        """Execute one step. Returns True if a stop was requested."""
+        if self.stop_event.is_set():
+            return True
+        t = step["type"]
+        if t == "click":
+            pyautogui.click(*step["point"], button=button)
+        elif t == "keys":
+            pyautogui.hotkey(*split_combo(step["keys"]), interval=0.05)
+        elif t == "type":
+            pyautogui.write(step["text"], interval=0.02)
+        elif t == "wait":
+            return self.stop_event.wait(step["seconds"])
+        return False
+
+    def _run(self, steps, loops, loop_delay, start_delay, button):
+        final = "Done."
+        count = 0
+        try:
+            t = start_delay
+            while t > 0:
+                self._status(f"Starting in {t:.0f}s…")
+                if self.stop_event.wait(min(1, t)):
+                    final = "Cancelled."
+                    return
+                t -= 1
+
+            total = f"/{loops}" if loops else ""
+            while loops == 0 or count < loops:
+                for i, step in enumerate(steps):
+                    self._highlight(i)
+                    self._status(f"Loop {count + 1}{total}  ·  step {i + 1}/{len(steps)}")
+                    if self._do(step, button):
+                        final = f"Stopped during loop {count + 1}."
+                        return
+                count += 1
+                if loops and count >= loops:
+                    break
+                if self.stop_event.wait(loop_delay):
+                    final = f"Stopped after {count} loop(s)."
+                    return
+            final = f"Done. Completed {count} loop(s)."
+        except pyautogui.FailSafeException:
+            final = "Fail-safe triggered (mouse in corner). Stopped."
+        finally:
+            self.root.after(0, self._finished, final)
+
+    def _finished(self, text):
+        self.status.set(text)
+        self._set_locked(False)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    SequenceClicker(root)
+    root.mainloop()
